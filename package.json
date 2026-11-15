@@ -1,0 +1,1 @@
+{"description":"A single-process GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL, and MCP, implemented from the wire protocols up with no git binary.","engines":{"node":">=22.18.0"},"license":"MIT","main":"main.ts","name":"github-core-clone-01","private":true,"scripts":{"start":"node main.ts"},"type":"module","version":"1.0.0"}
