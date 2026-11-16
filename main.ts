@@ -1,101 +1,95 @@
-// Forge entrypoint: starts the HTTP server, then either registers with the
-// trial environment and waits for its done signal (managed mode), or serves
-// forever on $PORT for local development (standalone mode).
+// Trial lifecycle: bind an ephemeral port, register it with the environment service, serve
+// until the environment reports done, then exit 0.
+//
+// The harness contract, in order: the entry binds port 0 on all interfaces; it POSTs
+// {"port": N} to $MAKEFUN_ENV_URL/register (a 400/405 there is a contract error and exits 1,
+// anything else is retried, and a 409 means a registration already stands); it answers
+// GET /healthz with 200; and it polls GET $MAKEFUN_ENV_URL/done with backoff from 250 ms to
+// 2000 ms until {"done": true}, then exits 0. Nothing here depends on the wall clock for
+// answers — only for retry timing.
 
-import { createForgeServer } from './app.ts';
+import { Store } from './store.ts';
+import { createServer } from './app.ts';
 
 const ENV_URL = process.env.MAKEFUN_ENV_URL ?? '';
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function register(port: number): Promise<void> {
-  const target = `${ENV_URL.replace(/\/$/, '')}/register`;
+async function register(port) {
+  const url = `${ENV_URL.replace(/\/$/, '')}/register`;
+  let delay = 250;
   const deadline = Date.now() + 15000;
   for (;;) {
+    let response = null;
     try {
-      const response = await fetch(target, {
+      response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ port }),
       });
-      if (response.status === 200 || response.status === 409) return;
-      console.error(`register: unexpected status ${response.status}`);
-    } catch (error) {
-      console.error(`register: ${(error as Error).message}`);
+    } catch {
+      response = null;
     }
-    if (Date.now() >= deadline) throw new Error('register: timed out after 15s');
-    await sleep(250);
-  }
-}
-
-async function waitForDone(): Promise<void> {
-  const target = `${ENV_URL.replace(/\/$/, '')}/done`;
-  let delay = 250;
-  for (;;) {
-    try {
-      const response = await fetch(target, { method: 'GET' });
-      if (response.ok) {
-        const payload = (await response.json()) as { done?: unknown };
-        if (payload.done === true) return;
+    if (response !== null) {
+      if (response.status >= 200 && response.status < 300) return;
+      if (response.status === 409) return; // a registration already stands
+      if (response.status === 400 || response.status === 405) {
+        console.error(`register rejected with ${response.status}; exiting`);
+        process.exit(1);
       }
-    } catch (error) {
-      console.error(`done poll: ${(error as Error).message}`);
+    }
+    if (Date.now() + delay > deadline) {
+      console.error('register did not succeed within the boot budget; exiting');
+      process.exit(1);
     }
     await sleep(delay);
     delay = Math.min(delay * 2, 2000);
   }
 }
 
-async function main(): Promise<void> {
-  const { server } = createForgeServer();
-  const managed = ENV_URL !== '';
-
-  // Let the harness stop the process cleanly: drain the server, then exit.
-  // (The done poll is the normal shutdown path; this covers signals.)
-  let shuttingDown = false;
-  const shutdown = (): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.error('forge: signal received, shutting down');
-    server.closeAllConnections?.();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
-  };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-
-  if (managed) {
-    const port = await new Promise<number>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        const address = server.address();
-        if (address && typeof address === 'object') resolve(address.port);
-        else reject(new Error('could not determine bound port'));
-      });
-    });
-    console.error(`forge: bound ephemeral port ${port}`);
-    await register(port);
-    console.error('forge: registered with the trial environment');
-    await waitForDone();
-    console.error('forge: done signal received, exiting');
-    server.closeAllConnections?.();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    process.exit(0);
+async function waitForDone() {
+  const url = `${ENV_URL.replace(/\/$/, '')}/done`;
+  let delay = 250;
+  for (;;) {
+    try {
+      const response = await fetch(url, { method: 'GET' });
+      if (response.ok) {
+        const payload = await response.json();
+        if (payload !== null && typeof payload === 'object' && payload.done === true) return;
+      }
+    } catch {
+      // The environment endpoint may not be answering yet; keep polling.
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 2000);
   }
-
-  const port = parseInt(process.env.PORT ?? '3000', 10);
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(Number.isFinite(port) ? port : 3000, '127.0.0.1', () => resolve());
-  });
-  const address = server.address();
-  const bound = address && typeof address === 'object' ? address.port : port;
-  console.log(`forge listening on http://127.0.0.1:${bound} (standalone)`);
 }
 
-main().catch((error: unknown) => {
-  console.error('fatal:', (error as Error).message);
+async function main() {
+  if (ENV_URL === '') {
+    console.error('MAKEFUN_ENV_URL is not set; refusing to start without the trial environment');
+    process.exit(1);
+  }
+  const store = new Store();
+  const server = createServer({ store, token: TOKEN });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', resolve);
+  });
+  const address = server.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+  if (port === 0) {
+    console.error('failed to bind an ephemeral port; exiting');
+    process.exit(1);
+  }
+  await register(port);
+  await waitForDone();
+  server.close();
+  process.exit(0);
+}
+
+main().catch((error) => {
+  console.error('fatal:', error);
   process.exit(1);
 });
