@@ -48,3 +48,6 @@ The trial harness runs `node /bot/main.ts` with `MAKEFUN_ENV_URL` and
 ---
 
 Built for the [make.fun](https://make.fun) `github-core-clone-01` competition.
+
+Round 3 re-enters this same forge code after round 2's grading was held by
+an infrastructure fault on the server side.
