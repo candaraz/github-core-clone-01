@@ -282,17 +282,34 @@ func main() {
 	port := listener.Addr().(*net.TCPAddr).Port
 	fmt.Printf("forge listening on port %d\n", port)
 
-	httpServer := &http.Server{Handler: server}
-	go func() {
-		_ = httpServer.Serve(listener)
-	}()
+	// Transport: the raw HTTP/1.1 server by default (see rawhttp.go); set
+	// FORGE_RAW_HTTP=0 to fall back to net/http.
+	var httpServer *http.Server
+	var raw *rawServer
+	if os.Getenv("FORGE_RAW_HTTP") == "0" {
+		httpServer = &http.Server{Handler: server}
+		go func() {
+			_ = httpServer.Serve(listener)
+		}()
+	} else {
+		raw = newRawServer(server, listener)
+		go raw.Serve()
+	}
+	shutdown := func() {
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
+		if raw != nil {
+			_ = raw.Close()
+		}
+	}
 
 	// Graceful exit on signals.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		_ = httpServer.Close()
+		shutdown()
 		os.Exit(0)
 	}()
 
@@ -302,7 +319,7 @@ func main() {
 		os.Exit(1)
 	}
 	pollDone(client, envURL)
-	_ = httpServer.Close()
+	shutdown()
 	os.Exit(0)
 }
 

@@ -13,10 +13,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const zeroOID = "0000000000000000000000000000000000000000"
@@ -36,15 +38,31 @@ func isOID(s string) bool {
 	return true
 }
 
+// sha1Pool reuses hashers: a push hashes every object, and allocating a new
+// sha1.Hash plus the header strings and hex string per object is pure waste.
+var sha1Pool = sync.Pool{New: func() any { return sha1.New() }}
+
 // hashObject is git's object id: SHA-1 over "<type> <size>\0" + bytes.
+// The header is built in a stack buffer (no string/byte conversions) and the
+// hex id is written into a fixed array (no EncodeToString allocation).
 func hashObject(typ string, data []byte) string {
-	h := sha1.New()
-	h.Write([]byte(typ))
-	h.Write([]byte(" "))
-	h.Write([]byte(strconv.Itoa(len(data))))
-	h.Write([]byte{0})
+	h := sha1Pool.Get().(hash.Hash)
+	defer sha1Pool.Put(h)
+	h.Reset()
+	var hdr [32]byte
+	n := copy(hdr[:], typ)
+	hdr[n] = ' '
+	n++
+	n += copy(hdr[n:], strconv.Itoa(len(data)))
+	hdr[n] = 0
+	n++
+	h.Write(hdr[:n])
 	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	var sum [sha1.Size]byte
+	h.Sum(sum[:0])
+	var out [40]byte
+	hex.Encode(out[:], sum[:])
+	return string(out[:])
 }
 
 func oidBytes(oid string) ([]byte, bool) {
@@ -62,22 +80,22 @@ func oidBytes(oid string) ([]byte, bool) {
 
 // putObject stores an object, computing its id, and caches its parsed form.
 // Returns the id. Malformed commits/trees are stored raw with no cache entry;
-// walks treat them as leaves rather than failing.
+// walks treat them as leaves rather than failing. The object takes ownership
+// of data: every caller passes a freshly allocated slice (pack inflate,
+// delta apply, commit/tree builders, base64 decode), so no copy is needed.
 func (r *Repo) putObject(typ string, data []byte) string {
 	oid := hashObject(typ, data)
 	if _, exists := r.Objects[oid]; exists {
 		return oid
 	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	r.Objects[oid] = &Object{Type: typ, Data: cp}
+	r.Objects[oid] = &Object{Type: typ, Data: data}
 	switch typ {
 	case "commit":
-		if ci, ok := parseCommit(cp); ok {
+		if ci, ok := parseCommit(data); ok {
 			r.CommitCache[oid] = ci
 		}
 	case "tree":
-		if entries, ok := parseTree(cp); ok {
+		if entries, ok := parseTree(data); ok {
 			r.TreeCache[oid] = entries
 		}
 	}
@@ -926,6 +944,14 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 	return out, nil
 }
 
+// zlibWriterPool reuses deflate writers: a fresh zlib writer allocates a
+// 32 KiB window plus hash tables per object, and writePack builds one per
+// object. Writers are Reset to the pack buffer before each use.
+var zlibWriterPool = sync.Pool{New: func() any {
+	w, _ := zlib.NewWriterLevel(&bytes.Buffer{}, 1)
+	return w
+}}
+
 // writePack builds a packfile from plain objects (no deltas), in the given
 // order, with a SHA-1 trailer. Deflate level 1: pack bytes stay valid at any
 // level, and level 1 is the fastest.
@@ -938,9 +964,11 @@ func writePack(objects []*Object) []byte {
 	buf.Write(header)
 	for _, obj := range objects {
 		writePackObjectHeader(&buf, typeCode(obj.Type), len(obj.Data))
-		zw, _ := zlib.NewWriterLevel(&buf, 1)
+		zw := zlibWriterPool.Get().(*zlib.Writer)
+		zw.Reset(&buf)
 		zw.Write(obj.Data)
 		zw.Close()
+		zlibWriterPool.Put(zw)
 	}
 	body := buf.Bytes()
 	sum := sha1.Sum(body)

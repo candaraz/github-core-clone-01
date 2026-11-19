@@ -927,10 +927,11 @@ func (s *Server) createIssue(w http.ResponseWriter, r *http.Request, owner, name
 	repo.NextIssue++
 	repo.Issues = append(repo.Issues, issue)
 	repo.IssuesByNum[issue.Number] = issue
-	view := issueView(issue)
-	s.cacheIssueJSON(repo, issue)
+	// cacheIssueJSON marshals the view once and returns the bytes; send those
+	// same bytes instead of marshaling the view a second time.
+	issueBody := s.cacheIssueJSON(repo, issue)
 	s.store.mu.Unlock()
-	s.writeJSON(w, http.StatusCreated, view)
+	s.writeJSONBytes(w, http.StatusCreated, issueBody)
 }
 
 func (s *Server) listIssues(w http.ResponseWriter, r *http.Request, owner, name string) {
@@ -1037,10 +1038,11 @@ func (s *Server) patchIssue(w http.ResponseWriter, r *http.Request, owner, name 
 		}
 		issue.Labels = append([]string(nil), labels...)
 	}
-	view := issueView(issue)
-	s.cacheIssueJSON(repo, issue)
+	// cacheIssueJSON marshals the view once and returns the bytes; send those
+	// same bytes instead of marshaling the view a second time.
+	issueBody := s.cacheIssueJSON(repo, issue)
 	s.store.mu.Unlock()
-	s.writeJSON(w, http.StatusOK, view)
+	s.writeJSONBytes(w, http.StatusOK, issueBody)
 }
 
 func (s *Server) listComments(w http.ResponseWriter, r *http.Request, owner, name string, num int) {
